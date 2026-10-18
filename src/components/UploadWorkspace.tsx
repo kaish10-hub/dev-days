@@ -1,6 +1,8 @@
 import React, {useEffect, useRef, useState} from 'react'
 import { X, Download, Image, File } from 'lucide-react'
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib'
+import ChecklistPanel from './ChecklistPanel'
+import { workflowConfigs } from '../data/workflowConfigs'
 
 type UploadFile = {
   id: string
@@ -18,10 +20,16 @@ const DOCUMENT_TYPES = ['Passport','Birth Certificate','College Form','Photo','O
 
 export default function UploadWorkspace({preservedWorkflowId}:{preservedWorkflowId?:string | null}){
   const [items, setItems] = useState<UploadFile[]>([])
+  // assignments: requirementId -> uploadId
+  const [assignments, setAssignments] = useState<Record<string,string>>({})
+  // conditional confirmations: conditionKey -> true/false/null
+  const [conditionConfirmed, setConditionConfirmed] = useState<Record<string,boolean | null>>({})
+
   // expose a simplified UploadItem shape for the checklist engine
   const uploadItemsForChecklist = items.map(i=> ({ id: i.id, fileName: i.file.name, type: i.type, size: i.size, mime: i.file.type }))
   const [dragOver, setDragOver] = useState(false)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const pendingAssignRef = useRef<string | null>(null) // requirement id awaiting next upload
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
 
@@ -29,7 +37,8 @@ export default function UploadWorkspace({preservedWorkflowId}:{preservedWorkflow
     return ()=>{ items.forEach(i=>URL.revokeObjectURL(i.url)) }
   }, [items])
 
-  function addFiles(files: FileList | null){
+  // optional param to auto-assign the first added file to a requirement
+  function addFiles(files: FileList | null, autoAssignReqId?: string){
     if(!files) return
     const arr = Array.from(files)
     const newItems : UploadFile[] = arr.map(f=>{
@@ -46,11 +55,28 @@ export default function UploadWorkspace({preservedWorkflowId}:{preservedWorkflow
         error: !ok ? 'Unsupported file type' : (tooLarge ? 'File too large (max 10MB)' : undefined)
       }
     })
-    setItems(prev=>[...prev, ...newItems])
+
+    setItems(prev=>{
+      const combined = [...prev, ...newItems]
+      // if autoAssignReqId provided, assign the first new item to that requirement
+      if(autoAssignReqId && newItems.length>0){
+        const firstNew = newItems[0]
+        // prevent duplicate assignment if upload is already assigned
+        setAssignments(asg=>{
+          const already = Object.values(asg).includes(firstNew.id)
+          if(already) return asg
+          return { ...asg, [autoAssignReqId]: firstNew.id }
+        })
+      }
+      return combined
+    })
   }
 
   function onFileChange(e:React.ChangeEvent<HTMLInputElement>){
-    addFiles(e.target.files)
+    // if a pending auto-assign target exists, use it
+    const pendingReq = pendingAssignRef.current
+    addFiles(e.target.files, pendingReq || undefined)
+    pendingAssignRef.current = null
     e.currentTarget.value = ''
   }
 
@@ -60,11 +86,45 @@ export default function UploadWorkspace({preservedWorkflowId}:{preservedWorkflow
     addFiles(e.dataTransfer.files)
   }
 
+  // assign an existing upload to a requirement
+  function assignUploadToRequirement(reqId:string, uploadId:string){
+    // prevent duplicate usage unless explicitly allowed: disallow if upload already assigned
+    const alreadyAssigned = Object.entries(assignments).find(([k,v])=> v===uploadId)
+    if(alreadyAssigned && alreadyAssigned[0] !== reqId){
+      setMessage('This upload is already assigned to another requirement. Reassigning is required to reuse.')
+      return
+    }
+    setAssignments(prev=> ({ ...prev, [reqId]: uploadId }))
+  }
+
+  // trigger file picker and auto-assign next selected file to reqId
+  function triggerUploadForRequirement(reqId:string){
+    pendingAssignRef.current = reqId
+    fileInputRef.current?.click()
+  }
+
+  function onAssignFromSelect(reqId:string, uploadId:string){
+    if(!uploadId) return
+    assignUploadToRequirement(reqId, uploadId)
+  }
+
+  function onConfirmCondition(conditionKey:string, value:boolean | null){
+    setConditionConfirmed(prev=> ({ ...prev, [conditionKey]: value }))
+  }
+
   function removeItem(id:string){
     setItems(prev=>{
       const found = prev.find(p=>p.id===id)
       if(found) URL.revokeObjectURL(found.url)
       return prev.filter(p=>p.id!==id)
+    })
+    // remove any assignment referencing this upload
+    setAssignments(prev=>{
+      const copy = {...prev}
+      for(const k of Object.keys(copy)){
+        if(copy[k]===id) delete copy[k]
+      }
+      return copy
     })
   }
 
@@ -185,19 +245,38 @@ export default function UploadWorkspace({preservedWorkflowId}:{preservedWorkflow
           <Download size={16} /> {busy ? 'Preparing...' : 'Download Combined PDF'}
         </button>
 
-        <button onClick={()=>{ setItems([]); setMessage(null) }} className="px-4 py-2 border rounded">Clear</button>
+        <button onClick={()=>{ setItems([]); setAssignments({}); setMessage(null) }} className="px-4 py-2 border rounded">Clear</button>
       </div>
 
       {message && <div className="mt-3 text-sm text-gray-700">{message}</div>
         }
     </div>
 
-    <div>
-      {/* Checklist panel on the right column */}
-    </div>
-  </div>
+        <aside>
+          <ChecklistPanel
+            uploads={uploadItemsForChecklist}
+            workflow={preservedWorkflowId ? workflowConfigs[preservedWorkflowId] : null}
+            assignments={assignments}
+            conditionConfirmed={conditionConfirmed}
+            onUploadNew={(reqId)=> triggerUploadForRequirement(reqId)}
+            onAssign={(reqId, uploadId)=> onAssignFromSelect(reqId, uploadId)}
+            onConfirmCondition={(conditionKey, value)=> onConfirmCondition(conditionKey, value)}
+          />
+        </aside>
+      </div>
 
-  {/* Render checklist below (for small screens) */}
-  </div>
+      {/* Render checklist below (for small screens) */}
+      <div className="mt-4 md:hidden">
+        <ChecklistPanel
+          uploads={uploadItemsForChecklist}
+          workflow={preservedWorkflowId ? workflowConfigs[preservedWorkflowId] : null}
+          assignments={assignments}
+          conditionConfirmed={conditionConfirmed}
+          onUploadNew={(reqId)=> triggerUploadForRequirement(reqId)}
+          onAssign={(reqId, uploadId)=> onAssignFromSelect(reqId, uploadId)}
+          onConfirmCondition={(conditionKey, value)=> onConfirmCondition(conditionKey, value)}
+        />
+      </div>
+    </div>
   )
 }
