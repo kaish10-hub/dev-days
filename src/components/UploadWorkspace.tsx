@@ -10,8 +10,14 @@ type UploadFile = {
   url: string
   type: string
   size: number
-  status: 'ready' | 'error' | 'uploading' | 'done'
+  status: 'ready' | 'error' | 'uploading' | 'processing' | 'done'
   error?: string
+  suggestedType?: string | null
+  suggestedConfidence?: number | null
+  suggestedExplanation?: string | null
+  processingStatus?: 'pending' | 'processing' | 'done' | 'error' | 'skipped'
+  manualConfirmed?: boolean
+  skipOCR?: boolean
 }
 
 const ACCEPTED = ['application/pdf', 'image/png', 'image/jpeg']
