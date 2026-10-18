@@ -18,6 +18,8 @@ const DOCUMENT_TYPES = ['Passport','Birth Certificate','College Form','Photo','O
 
 export default function UploadWorkspace({preservedWorkflowId}:{preservedWorkflowId?:string | null}){
   const [items, setItems] = useState<UploadFile[]>([])
+  // expose a simplified UploadItem shape for the checklist engine
+  const uploadItemsForChecklist = items.map(i=> ({ id: i.id, fileName: i.file.name, type: i.type, size: i.size, mime: i.file.type }))
   const [dragOver, setDragOver] = useState(false)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const [busy, setBusy] = useState(false)
@@ -125,6 +127,8 @@ export default function UploadWorkspace({preservedWorkflowId}:{preservedWorkflow
 
   return (
     <div className="card">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
       <div className="flex items-center justify-between mb-3">
         <h2 className="text-lg font-semibold">Document Upload</h2>
         <div className="text-xs text-gray-500">Demo mode — verify official requirements</div>
@@ -184,7 +188,16 @@ export default function UploadWorkspace({preservedWorkflowId}:{preservedWorkflow
         <button onClick={()=>{ setItems([]); setMessage(null) }} className="px-4 py-2 border rounded">Clear</button>
       </div>
 
-      {message && <div className="mt-3 text-sm text-gray-700">{message}</div>}
+      {message && <div className="mt-3 text-sm text-gray-700">{message}</div>
+        }
     </div>
+
+    <div>
+      {/* Checklist panel on the right column */}
+    </div>
+  </div>
+
+  {/* Render checklist below (for small screens) */}
+  </div>
   )
 }
