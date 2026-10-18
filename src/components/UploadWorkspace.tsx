@@ -38,6 +38,7 @@ export default function UploadWorkspace({preservedWorkflowId}:{preservedWorkflow
   const pendingAssignRef = useRef<string | null>(null) // requirement id awaiting next upload
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
+  const [ocrControllers, setOcrControllers] = useState<Record<string, AbortController>>({})
 
   useEffect(()=> {
     return ()=>{ items.forEach(i=>URL.revokeObjectURL(i.url)) }
@@ -76,6 +77,9 @@ export default function UploadWorkspace({preservedWorkflowId}:{preservedWorkflow
       }
       return combined
     })
+
+    // start classification/OCR for each new item (non-blocking)
+    newItems.forEach(it=> processFile(it))
   }
 
   function onFileChange(e:React.ChangeEvent<HTMLInputElement>){
@@ -84,6 +88,30 @@ export default function UploadWorkspace({preservedWorkflowId}:{preservedWorkflow
     addFiles(e.target.files, pendingReq || undefined)
     pendingAssignRef.current = null
     e.currentTarget.value = ''
+  }
+
+  // process a single file: classify/ocr and update item state
+  async function processFile(item: UploadFile){
+    // skip if manualConfirmed or skipOCR or unsupported mime
+    if(item.manualConfirmed || item.skipOCR) return
+    const controller = new AbortController()
+    setOcrControllers(prev=> ({ ...prev, [item.id]: controller }))
+    setItems(prev=> prev.map(p=> p.id===item.id ? {...p, processingStatus: 'processing', status: 'processing', error: undefined, suggestedType: null, suggestedConfidence: null, suggestedExplanation: null,} : p))
+    try{
+      // dynamically import classifier to avoid loading heavy libs earlier
+      const { classifyFile } = await import('../lib/classifier')
+      const res = await classifyFile(item.file, { ocr: true, pageLimit: 2, signal: controller.signal })
+      if(controller.signal.aborted){
+        setItems(prev=> prev.map(p=> p.id===item.id ? {...p, processingStatus: 'error', status: 'error', error: 'aborted'} : p))
+        setOcrControllers(prev=>{ const c = {...prev}; delete c[item.id]; return c })
+        return
+      }
+      setItems(prev=> prev.map(p=> p.id===item.id ? {...p, processingStatus: 'done', status: 'ready', suggestedType: res.suggested || null, suggestedConfidence: res.confidence || null, suggestedExplanation: res.explanation || null} : p))
+      setOcrControllers(prev=>{ const c = {...prev}; delete c[item.id]; return c })
+    }catch(err:any){
+      setItems(prev=> prev.map(p=> p.id===item.id ? {...p, processingStatus: 'error', status: 'error', error: String(err?.message || err)} : p))
+      setOcrControllers(prev=>{ const c = {...prev}; delete c[item.id]; return c })
+    }
   }
 
   function onDrop(e:React.DragEvent){
@@ -135,7 +163,21 @@ export default function UploadWorkspace({preservedWorkflowId}:{preservedWorkflow
   }
 
   function onTypeChange(id:string, type:string){
-    setItems(prev=>prev.map(p=> p.id===id ? {...p, file: p.file, type} : p))
+    setItems(prev=>prev.map(p=> p.id===id ? {...p, file: p.file, type, manualConfirmed: true} : p))
+  }
+
+  function acceptSuggestion(id:string){
+    setItems(prev=> prev.map(p=> p.id===id ? {...p, type: p.suggestedType || p.type, manualConfirmed: true} : p))
+  }
+  function rejectSuggestion(id:string){
+    setItems(prev=> prev.map(p=> p.id===id ? {...p, suggestedType: null, suggestedConfidence: null, suggestedExplanation: null} : p))
+  }
+
+  function cancelOcrFor(id:string){
+    const ctrl = ocrControllers[id]
+    if(ctrl) ctrl.abort()
+    setOcrControllers(prev=>{ const c = {...prev}; delete c[id]; return c })
+    setItems(prev=> prev.map(p=> p.id===id ? {...p, processingStatus: 'skipped', status: 'ready'} : p))
   }
 
   function onDragStart(e:React.DragEvent, idx:number){
@@ -231,15 +273,38 @@ export default function UploadWorkspace({preservedWorkflowId}:{preservedWorkflow
                 <div className="text-xs text-gray-500">{it.status==='error' ? <span className="text-red-600">{it.error}</span> : it.status}</div>
               </div>
 
-              <div className="mt-2 flex items-center gap-2">
-                <select aria-label="Assign document type" value={it.type} onChange={(e)=>onTypeChange(it.id, e.target.value)} className="px-2 py-1 border rounded text-sm">
-                  <option value="image">Image</option>
-                  <option value="pdf">PDF</option>
-                  {DOCUMENT_TYPES.map(dt=> (<option key={dt} value={dt}>{dt}</option>))}
-                </select>
+              <div className="mt-2">
+                <div className="flex items-center gap-2">
+                  <select aria-label="Assign document type" value={it.type} onChange={(e)=>onTypeChange(it.id, e.target.value)} className="px-2 py-1 border rounded text-sm">
+                    <option value="image">Image</option>
+                    <option value="pdf">PDF</option>
+                    {DOCUMENT_TYPES.map(dt=> (<option key={dt} value={dt}>{dt}</option>))}
+                  </select>
 
-                <button onClick={()=>window.open(it.url,'_blank')} className="px-2 py-1 border rounded text-sm bg-white">Preview</button>
-                <button onClick={()=>removeItem(it.id)} className="px-2 py-1 border rounded text-sm text-red-600"><X size={14} /></button>
+                  <button onClick={()=>window.open(it.url,'_blank')} className="px-2 py-1 border rounded text-sm bg-white">Preview</button>
+                  <button onClick={()=>removeItem(it.id)} className="px-2 py-1 border rounded text-sm text-red-600"><X size={14} /></button>
+                </div>
+
+                <div className="mt-2 text-sm text-gray-600">
+                  {it.processingStatus === 'processing' && (
+                    <div className="flex items-center gap-2">Processing: OCR running <button onClick={()=>cancelOcrFor(it.id)} className="ml-2 text-xs underline">Cancel</button></div>
+                  )}
+                  {it.processingStatus === 'done' && it.suggestedType && !it.manualConfirmed && (
+                    <div className="flex items-center gap-3">
+                      <div className="text-xs">Suggestion: <strong>{it.suggestedType}</strong> {it.suggestedConfidence ? `(${Math.round(it.suggestedConfidence*100)}%)` : ''}</div>
+                      <button onClick={()=>acceptSuggestion(it.id)} className="px-2 py-1 bg-[#0f1724] text-white rounded text-xs">Accept</button>
+                      <button onClick={()=>rejectSuggestion(it.id)} className="px-2 py-1 border rounded text-xs">Reject</button>
+                    </div>
+                  )}
+
+                  {it.processingStatus === 'error' && (
+                    <div className="text-xs text-red-600">OCR failed: {it.error}</div>
+                  )}
+
+                  {it.suggestedExplanation && (
+                    <div className="text-xs text-gray-500 mt-1">{it.suggestedExplanation}</div>
+                  )}
+                </div>
               </div>
             </div>
           </div>

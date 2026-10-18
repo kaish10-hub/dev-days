@@ -60,25 +60,48 @@ export function classifyText(text: string, fileName?: string): ClassifyResult{
 }
 
 // attempt to OCR an image using tesseract.js when available; returns extracted text or empty on failure
-export async function ocrImageFile(file: File): Promise<{ text: string, error?: string }>{
+export async function ocrImageFile(file: File, options: { signal?: AbortSignal } = {}): Promise<{ text: string, error?: string }>{
+  let worker: any = null
+  let aborted = false
   try{
     // dynamically import tesseract to keep tests fast when not used
     const { createWorker } = await import('tesseract.js')
-    const worker = await createWorker({ logger: ()=>{} })
+    worker = await createWorker({ logger: ()=>{} })
     await worker.load()
     await worker.loadLanguage('eng')
     await worker.initialize('eng')
+
+    // attach abort listener to terminate worker if needed
+    const onAbort = () => {
+      aborted = true
+      try{ worker?.terminate?.() }catch(_){ }
+    }
+    if(options.signal){
+      if(options.signal.aborted){
+        onAbort()
+        return { text: '', error: 'aborted' }
+      }
+      options.signal.addEventListener('abort', onAbort)
+    }
+
     const arrayBuffer = await file.arrayBuffer()
+    if(aborted){
+      await worker.terminate()
+      return { text: '', error: 'aborted' }
+    }
+
     // tesseract accepts Blob/URL/ArrayBuffer; pass Buffer
     const { data: { text } } = await worker.recognize(new Uint8Array(arrayBuffer))
     await worker.terminate()
+    if(options.signal) options.signal.removeEventListener('abort', onAbort)
     return { text }
   }catch(err:any){
+    try{ if(worker) await worker.terminate() }catch(_){ }
     return { text: '', error: String(err?.message || err) }
   }
 }
 
-// naive PDF text extract: try to find readable ascii sequences within the binary
+// quick PDF embedded-text scan: try to find readable ascii sequences within the binary
 export async function extractTextFromPDFBuffer(buf: ArrayBuffer): Promise<string>{
   try{
     const s = new TextDecoder('utf-8', { fatal: false }).decode(buf)
@@ -93,15 +116,80 @@ export async function extractTextFromPDFBuffer(buf: ArrayBuffer): Promise<string
   }
 }
 
-export type ClassifyOptions = { ocr?: boolean }
+// OCR a (scanned) PDF by rendering pages with pdfjs and running OCR on rendered images
+export async function ocrPDFFile(file: File, options: { pageLimit?: number, signal?: AbortSignal } = {}): Promise<{ text: string, error?: string }>{
+  const pageLimit = options.pageLimit ?? 2
+  try{
+    const arrayBuffer = await file.arrayBuffer()
+    // try to import pdfjs
+    const pdfjs = await import('pdfjs-dist/legacy/build/pdf')
+    const doc = await pdfjs.getDocument({ data: arrayBuffer }).promise
+    const total = Math.min(doc.numPages, pageLimit)
+    let combinedText = ''
+    for(let i=1;i<=total;i++){
+      if(options.signal?.aborted) return { text: combinedText, error: 'aborted' }
+      const page = await doc.getPage(i)
+      // try to get selectable text first
+      try{
+        const content = await page.getTextContent()
+        const strs = content.items.map((it:any)=> (it.str || '')).join(' ')
+        if(strs && strs.trim().length>20){
+          combinedText += strs + '\n'
+          continue
+        }
+      }catch(_){
+        // ignore and fallback to rendering
+      }
 
-// classifyFile: extract text where possible, run classifyText rules; uses OCR for images when ocr=true
-export async function classifyFile(file: File, options: ClassifyOptions = { ocr: true }): Promise<ClassifyResult & { extracted?: string | null }>{
+      // render page to canvas if environment allows
+      const viewport = page.getViewport({ scale: 1.5 })
+      let canvas: any = null
+      let ctx: any = null
+      if(typeof OffscreenCanvas !== 'undefined'){
+        canvas = new OffscreenCanvas(viewport.width, viewport.height)
+        ctx = canvas.getContext('2d')
+      } else if(typeof document !== 'undefined'){
+        canvas = document.createElement('canvas')
+        canvas.width = viewport.width
+        canvas.height = viewport.height
+        ctx = canvas.getContext('2d')
+      }
+      if(!canvas || !ctx){
+        // Cannot render in this environment; skip
+        continue
+      }
+      await page.render({ canvasContext: ctx, viewport }).promise
+      // convert canvas to blob
+      let blob: Blob | null = null
+      if((canvas as OffscreenCanvas).convertToBlob){
+        blob = await (canvas as OffscreenCanvas).convertToBlob()
+      } else if(canvas.toBlob){
+        blob = await new Promise<Blob | null>((res)=> canvas.toBlob((b:any)=> res(b)))
+      }
+      if(blob){
+        const imgFile = new File([blob], `${file.name}-page-${i}.png`, { type: blob.type })
+        const ocr = await ocrImageFile(imgFile, { signal: options.signal })
+        if(ocr.error) return { text: combinedText, error: ocr.error }
+        combinedText += (ocr.text || '') + '\n'
+      }
+      // release canvas
+      try{ if(canvas && 'width' in canvas){ canvas.width = 0; canvas.height = 0 } }catch(_){ }
+    }
+    return { text: combinedText }
+  }catch(err:any){
+    return { text: '', error: String(err?.message || err) }
+  }
+}
+
+export type ClassifyOptions = { ocr?: boolean, pageLimit?: number, signal?: AbortSignal }
+
+// classifyFile: extract text where possible, run classifyText rules; uses OCR for images and scanned PDFs when ocr=true
+export async function classifyFile(file: File, options: ClassifyOptions = { ocr: true, pageLimit: 2 }): Promise<ClassifyResult & { extracted?: string | null }>{
   const mime = file.type || ''
-  let extracted = ''
+  let extracted: string | null = null
   if(mime.startsWith('image/')){
     if(options.ocr){
-      const { text, error } = await ocrImageFile(file)
+      const { text, error } = await ocrImageFile(file, { signal: options.signal })
       if(error) return { suggested: null, confidence: 0, explanation: `OCR failed: ${error}`, extracted: null }
       extracted = text || ''
       const r = classifyText(extracted, file.name)
@@ -112,17 +200,37 @@ export async function classifyFile(file: File, options: ClassifyOptions = { ocr:
   }
 
   if(mime === 'application/pdf'){
-    // attempt naive text extraction from PDF binary
+    const sizeLimit = 10 * 1024 * 1024 // 10MB default
     const buf = await file.arrayBuffer()
-    const t = await extractTextFromPDFBuffer(buf)
-    if(t && t.trim().length>20){
-      const r = classifyText(t, file.name)
-      return { ...r, extracted: t }
+    if(buf.byteLength > sizeLimit){
+      // avoid processing very large PDFs
+      const r = classifyText('', file.name)
+      return { ...r, confidence: r.confidence > 0 ? Math.min(40, r.confidence) : 0, explanation: r.explanation + ' (file too large for OCR; using filename heuristics)', extracted: null }
     }
-    // no embedded text found; if OCR enabled, we could try to run OCR on rendered pages — expensive/unsupported here
-    // fall back to filename heuristics
+
+    // first try embedded selectable text
+    const embedded = await extractTextFromPDFBuffer(buf)
+    if(embedded && embedded.trim().length>20){
+      const r = classifyText(embedded, file.name)
+      return { ...r, extracted: embedded }
+    }
+
+    // no embedded text; if OCR enabled, attempt pdf render + OCR
+    if(options.ocr){
+      const { text, error } = await ocrPDFFile(file, { pageLimit: options.pageLimit, signal: options.signal })
+      if(error) return { suggested: null, confidence: 0, explanation: `PDF OCR failed: ${error}`, extracted: null }
+      if(text && text.trim().length>20){
+        const r = classifyText(text, file.name)
+        return { ...r, extracted: text }
+      }
+      // OCR returned little; fall back to filename heuristics but mark low confidence and explain
+      const r = classifyText('', file.name)
+      return { ...r, confidence: r.confidence > 0 ? Math.min(40, r.confidence) : 0, explanation: r.explanation + ' (OCR produced no usable text; using filename heuristics)', extracted: null }
+    }
+
+    // OCR disabled; rely on filename heuristics (low confidence)
     const r = classifyText('', file.name)
-    return { ...r, confidence: r.confidence > 0 ? Math.max(10, r.confidence - 20) : 0, explanation: r.explanation + ' (from filename; embedded PDF text not found)', extracted: null }
+    return { ...r, confidence: r.confidence > 0 ? Math.min(40, r.confidence) : 0, explanation: r.explanation + ' (OCR disabled; filename heuristics)', extracted: null }
   }
 
   // unknown mime: try filename heuristics
